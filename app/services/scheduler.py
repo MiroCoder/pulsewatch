@@ -8,7 +8,7 @@ from app.services.checker import check_url
 
 running_tasks : dict[int, asyncio.Task] = {}
 
-
+monitor_locks : dict[int, asyncio.Lock] = {}
 
 
 async def periodic_check(url: str, interval_seconds: int):
@@ -40,6 +40,23 @@ def stop_monitor(monitor_id: int):
         del running_tasks[monitor_id]
     else:
         del running_tasks[monitor_id]
+
+async def restart_monitor(monitor_id: int, url:str, interval_seconds:int):
+    lock = monitor_locks.setdefault(monitor_id, asyncio.Lock())
+
+
+    async with lock:
+        task = running_tasks.get(monitor_id)
+        if task is not None:
+            stop_monitor(monitor_id)
+
+            try:
+                await task
+            except asyncio.CancelledError:
+                print("Monitoring stopped")
+
+        start_monitor(monitor_id, url, interval_seconds)
+
 
 async def main():
 

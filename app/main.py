@@ -1,10 +1,12 @@
 from fastapi import FastAPI, HTTPException, Depends, Query
 from pydantic import BaseModel, HttpUrl, Field
 
-from app.database import engine, get_db
+from app.database import engine, get_db, get_async_db
+from sqlalchemy.ext.asyncio import AsyncSession
 from app.models import Monitor, CheckResult
 from sqlalchemy import select, func
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from app.services.checker import check_url
 from contextlib import asynccontextmanager
@@ -19,6 +21,11 @@ class MonitorCreate(BaseModel):
     url: HttpUrl
     interval_seconds: int = Field(gt=0)
 
+class MonitorReplace(BaseModel):
+    name: str
+    url: HttpUrl
+    interval_Seconds: int = Field(gt=0)
+    is_active : bool
 
 TRUSTED_URLS = {
     "https://example.com/",
@@ -135,29 +142,37 @@ def delete_monitor(monitor_id: int, session: Session = Depends(get_db)):
 
 
 @app.post("/monitors/{monitor_id}/check")
-async def check_monitor(monitor_id: int, session: Session = Depends(get_db)):
-    monitor = session.get(Monitor, monitor_id)
+async def check_monitor(monitor_id: int, session: AsyncSession = Depends(get_async_db)):
+    async with session.begin():
+        monitor = await session.get(Monitor, monitor_id)
 
-    if monitor is None:
-        raise HTTPException(status_code=404)
+        if monitor is None:
+            raise HTTPException(status_code=404)
 
-    if not monitor.is_active:
-        raise HTTPException(409, detail="Monitor is paused")
+        if not monitor.is_active:
+            raise HTTPException(409, detail="Monitor is paused")
 
-    url = str(monitor.url)
+        url = str(monitor.url)
 
     res = await check_url(url)
-    check_result = CheckResult(monitor_id=monitor_id,
-                               status_code=res["status_code"],
-                               latency_ms=res["latency_ms"],
-                               error=res["error"]
-                               )
-    session.add(check_result)
-    session.commit()
-    session.refresh(check_result)
+
+    try:
+        async with session.begin():
+                check_result = CheckResult(monitor_id=monitor_id,
+                                           status_code=res["status_code"],
+                                           latency_ms=res["latency_ms"],
+                                           error=res["error"]
+                                           )
+                session.add(check_result)
+                await session.flush()
+                check_id = check_result.id
+    except IntegrityError:
+        raise HTTPException(status_code=409,
+        detail="Could not save check due to a database conflict"
+    )
 
     return {"monitor_id": monitor_id,
-            "check_id": check_result.id,
+            "check_id": check_id,
             "status_code": res["status_code"],
             "latency_ms": res["latency_ms"],
             "error": res["error"]
@@ -224,3 +239,17 @@ def get_monitor_stats(monitor_id: int, session: Session = Depends(get_db)):
         "failed_checks": failed,
         "average_latency_ms": average_latency_ms
     }
+
+@app.put("/monitors/{monitor_id}")
+def update_full_monitor(monitor_id : int,update : MonitorReplace, session : Session = Depends(get_db)):
+    monitor = session.get(Monitor, monitor_id)
+    if monitor is None:
+        raise HTTPException(404)
+
+    update_data = update.model_dump(mode="json")
+    for field,value in update_data.items():
+        setattr(monitor, field, value)
+
+    session.commit()
+    session.refresh(monitor)
+    return monitor
