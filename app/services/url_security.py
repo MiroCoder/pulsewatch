@@ -3,6 +3,12 @@ import socket
 
 from urllib.parse import urlsplit
 
+TRUSTED_URLS = {
+    "https://example.com/",
+    "https://github.com/",
+    "https://www.python.org/",
+}
+
 def is_public_ip(value: str) -> bool:
     try:
         return ipaddress.ip_address(value).is_global

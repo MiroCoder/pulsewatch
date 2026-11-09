@@ -3,7 +3,7 @@ from sqlalchemy import String, ForeignKey
 from .database import Base
 from sqlalchemy import DateTime, func
 from datetime import datetime
-from sqlalchemy import Boolean, true
+from sqlalchemy import Boolean, true, Index, text
 
 class Monitor(Base):
     __tablename__ = "monitors"
@@ -25,3 +25,21 @@ class CheckResult(Base):
     error: Mapped[str | None] = mapped_column(String, nullable = True)
     checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True),server_default=func.now())
     monitor: Mapped["Monitor"] = relationship(back_populates="checks")
+
+class Incident(Base):
+    __tablename__ = "incidents"
+
+    __table_args__ = (
+        Index(
+            "uq_open_incident_per_monitor",
+            "monitor_id",
+            unique=True,
+            postgresql_where=text("resolved_at IS NULL"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    monitor_id: Mapped[int] = mapped_column(ForeignKey("monitors.id"))
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default = func.now())
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable = True)
+    reason: Mapped[str | None] = mapped_column(String(200), nullable = True)

@@ -1,9 +1,11 @@
-from fastapi import FastAPI, HTTPException, Depends, Query
-from pydantic import BaseModel, HttpUrl, Field
+from datetime import datetime, timezone, timedelta
 
-from app.database import engine, get_db, get_async_db
+from fastapi import FastAPI, HTTPException, Depends, Query
+from pydantic import BaseModel, HttpUrl, Field, ConfigDict
+
+from app.database import engine, get_db, get_async_db, get_repeatable_db
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.models import Monitor, CheckResult
+from app.models import Monitor, CheckResult, Incident
 from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
@@ -11,9 +13,13 @@ from sqlalchemy.exc import IntegrityError
 from app.services.checker import check_url
 from contextlib import asynccontextmanager
 
-from app.services.scheduler import start_monitor, stop_monitor, running_tasks
+from app.services.incidents import process_incident
+from app.services.scheduler import start_monitor, stop_monitor, running_tasks, restart_monitor
 
 import asyncio
+from typing import Literal
+
+from app.services.url_security import TRUSTED_URLS
 
 
 class MonitorCreate(BaseModel):
@@ -27,11 +33,14 @@ class MonitorReplace(BaseModel):
     interval_Seconds: int = Field(gt=0)
     is_active : bool
 
-TRUSTED_URLS = {
-    "https://example.com/",
-    "https://github.com/",
-    "https://www.python.org/",
-}
+class IncidentRead(BaseModel):
+    id: int
+    monitor_id: int
+    started_at: datetime
+    resolved_at: datetime | None
+    reason: str | None
+
+    model_config = ConfigDict(from_attributes=True)
 
 
 @asynccontextmanager
@@ -78,15 +87,23 @@ class MonitorUpdate(BaseModel):
 
 
 @app.post("/monitors", status_code=201)
-def create_monitor(create: MonitorCreate, session: Session = Depends(get_db)):
+async def create_monitor(create: MonitorCreate, session: AsyncSession = Depends(get_async_db)):
     monitor = Monitor(name=create.name,
                       url=str(create.url),
                       interval_seconds=create.interval_seconds
                       )
 
+    url = str(create.url)
+
+    if url not in TRUSTED_URLS:
+        raise HTTPException(422, detail= "URL isn't allowed for monitoring")
+
     session.add(monitor)
-    session.commit()
-    session.refresh(monitor)
+    await session.commit()
+    await session.refresh(monitor)
+
+    if monitor.is_active:
+        start_monitor(monitor.id, str(monitor.url), monitor.interval_seconds)
 
     return monitor
 
@@ -109,8 +126,8 @@ def get_monitor_by_id(monitor_id: int, session: Session = Depends(get_db)):
 
 
 @app.patch("/monitors/{monitor_id}", status_code=200)
-def update_monitor(monitor_id: int, update: MonitorUpdate, session: Session = Depends(get_db)):
-    monitor = session.get(Monitor, monitor_id)
+async def update_monitor(monitor_id: int, update: MonitorUpdate, session: AsyncSession = Depends(get_async_db)):
+    monitor = await session.get(Monitor, monitor_id)
 
     if monitor is None:
         raise HTTPException(status_code=404)
@@ -121,24 +138,55 @@ def update_monitor(monitor_id: int, update: MonitorUpdate, session: Session = De
         if value is None:
             raise HTTPException(422)
 
+
+    old_config = (
+        str(monitor.url),
+        monitor.interval_seconds,
+        monitor.is_active
+    )
     for field, value in update_data.items():
         setattr(monitor, field, value)
 
-    session.commit()
-    session.refresh(monitor)
+    url = str(monitor.url)
+    interval_seconds = monitor.interval_seconds
+    is_active = monitor.is_active
+
+    new_config = (
+        str(monitor.url),
+        monitor.interval_seconds,
+        monitor.is_active
+
+    )
+    if is_active and url not in TRUSTED_URLS:
+        raise HTTPException(422)
+
+    await session.commit()
+
+    task = running_tasks.get(monitor_id)
+
+    task_missing = task is None or task.done()
+    needs_restart = is_active and (
+            old_config != new_config or task_missing
+    )
+    if needs_restart:
+        await restart_monitor(monitor_id, url, interval_seconds)
+    elif is_active == False:
+        stop_monitor(monitor_id)
+    await session.refresh(monitor)
 
     return monitor
 
 
 @app.delete("/monitors/{monitor_id}", status_code=204)
-def delete_monitor(monitor_id: int, session: Session = Depends(get_db)):
-    monitor = session.get(Monitor, monitor_id)
+async def delete_monitor(monitor_id: int, session: AsyncSession = Depends(get_async_db)):
+    monitor = await session.get(Monitor, monitor_id)
 
     if monitor is None:
         raise HTTPException(status_code=404)
 
-    session.delete(monitor)
-    session.commit()
+    await session.delete(monitor)
+    await session.commit()
+    stop_monitor(monitor_id)
 
 
 @app.post("/monitors/{monitor_id}/check")
@@ -158,6 +206,15 @@ async def check_monitor(monitor_id: int, session: AsyncSession = Depends(get_asy
 
     try:
         async with session.begin():
+                lock_stmt = (
+                    select(Monitor.id).where(Monitor.id == monitor_id).with_for_update())
+
+                result = await session.execute(lock_stmt)
+                locked_id = result.scalar_one_or_none()
+
+                if locked_id is None:
+                    raise HTTPException(404, detail="Monitor deleted")
+
                 check_result = CheckResult(monitor_id=monitor_id,
                                            status_code=res["status_code"],
                                            latency_ms=res["latency_ms"],
@@ -165,6 +222,9 @@ async def check_monitor(monitor_id: int, session: AsyncSession = Depends(get_asy
                                            )
                 session.add(check_result)
                 await session.flush()
+
+                await process_incident(session, monitor_id)
+
                 check_id = check_result.id
     except IntegrityError:
         raise HTTPException(status_code=409,
@@ -241,15 +301,122 @@ def get_monitor_stats(monitor_id: int, session: Session = Depends(get_db)):
     }
 
 @app.put("/monitors/{monitor_id}")
-def update_full_monitor(monitor_id : int,update : MonitorReplace, session : Session = Depends(get_db)):
-    monitor = session.get(Monitor, monitor_id)
+async def update_full_monitor(monitor_id : int,update : MonitorReplace, session : AsyncSession = Depends(get_async_db)):
+    monitor = await session.get(Monitor, monitor_id)
     if monitor is None:
         raise HTTPException(404)
 
     update_data = update.model_dump(mode="json")
+    old_config = (
+        str(monitor.url),
+        monitor.interval_seconds,
+        monitor.is_active
+    )
     for field,value in update_data.items():
         setattr(monitor, field, value)
 
-    session.commit()
-    session.refresh(monitor)
+    url = str(monitor.url)
+    interval_seconds = monitor.interval_seconds
+    is_active = monitor.is_active
+
+    new_config = (
+        str(monitor.url),
+        monitor.interval_seconds,
+        monitor.is_active
+
+    )
+    if is_active and url not in TRUSTED_URLS:
+        raise HTTPException(422)
+
+    await session.commit()
+
+    task = running_tasks.get(monitor_id)
+
+    task_missing = task is None or task.done()
+    needs_restart = is_active and (
+            old_config != new_config or task_missing
+    )
+    if needs_restart:
+        await restart_monitor(monitor_id, url, interval_seconds)
+    elif is_active == False:
+        stop_monitor(monitor_id)
+
+    await session.refresh(monitor)
     return monitor
+
+@app.get("/monitors/{monitor_id}/overview")
+async def get_monitor_overview(monitor_id:int, session: AsyncSession = Depends(get_repeatable_db)):
+    async with session.begin():
+        statement = await session.execute(select(Monitor).where(Monitor.id == monitor_id))
+        monitor = statement.scalar_one_or_none()
+
+        if monitor is None:
+            raise HTTPException(404, detail = "Monitor not found")
+
+        response = await session.execute(select(func.count(CheckResult.id)).where(CheckResult.monitor_id == monitor_id))
+        counts = response.scalar_one()
+    return {
+        "monitor_id": monitor_id,
+        "name": monitor.name,
+        "total_checks": counts
+    }
+
+@app.get("/monitors/{monitor_id}/incidents", response_model=list[IncidentRead])
+async def get_monitor_incidents(
+        monitor_id: int,
+        status: Literal["all", "open", "resolved"] = "all",
+        limit: int = Query(20, ge=1, le=100),
+        offset: int = Query(0, ge=0),
+        session: AsyncSession = Depends(get_async_db)
+):
+    statement = select(Monitor).where(Monitor.id == monitor_id)
+    monitor = await session.scalar(statement)
+
+    if monitor is None:
+        raise HTTPException(404)
+
+    statement2 = select(Incident).where(Incident.monitor_id == monitor_id)
+
+    if status == "open":
+            statement2 = statement2.where(Incident.resolved_at.is_(None))
+    elif status == "resolved":
+        statement2 = statement2.where(Incident.resolved_at.is_not(None))
+
+    statement2 = statement2.order_by(Incident.started_at.desc(), Incident.id.desc()).limit(limit).offset(offset)
+    result = await session.execute(statement2)
+    incident = result.scalars().all()
+
+    return incident
+
+@app.get("/monitors/{monitor_id}/availability")
+async def get_monitor_availability(monitor_id : int,
+                                   hours: int = Query(24, ge=1, le=720),
+                                   session: AsyncSession = Depends(get_async_db)):
+    statement = select(Monitor).where(Monitor.id == monitor_id)
+    monitor = await session.scalar(statement)
+
+    if monitor is None:
+        raise HTTPException(404)
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+
+    statement2 = select(func.count(CheckResult.id), func.count(CheckResult.id).filter(CheckResult.status_code >=200, CheckResult.status_code < 300, CheckResult.error.is_(None))).where(
+        CheckResult.monitor_id == monitor_id, CheckResult.checked_at >= cutoff
+    )
+    result = await session.execute(statement2)
+    total, successful = result.one()
+
+
+    if total == 0:
+        success_rate = None
+    else:
+        success_rate = successful / total * 100
+
+    return {
+        "monitor_id": monitor_id,
+        "hours": hours,
+        "total_checks": total,
+        "successful_checks": successful,
+        "failed_checks": (total-successful),
+        "success_rate": success_rate
+    }

@@ -1,14 +1,22 @@
-import asyncio
 import httpx
 
 import time
 
-
-
+from app.services.url_security import TRUSTED_URLS
 
 
 async def check_url(url: str):
-    async with httpx.AsyncClient(timeout=5.0) as client:
+    if url not in TRUSTED_URLS:
+        return {
+            "status_code": None,
+            "latency_ms": None,
+            "error": "URL not allowed"
+        }
+
+    async with httpx.AsyncClient(timeout=5.0,
+            follow_redirects=False,
+            trust_env=False
+        ) as client:
         start = time.perf_counter()
 
         try:
