@@ -420,3 +420,53 @@ async def get_monitor_availability(monitor_id : int,
         "failed_checks": (total-successful),
         "success_rate": success_rate
     }
+
+@app.get("/monitors/{monitor_id}/downtime")
+async def get_monitors_downtime(monitor_id: int,
+                                hours : int = Query(24,ge=1,le=720) ,
+                                session: AsyncSession = Depends(get_async_db)):
+    statement = select(Monitor).where(Monitor.id == monitor_id)
+    monitor = await session.scalar(statement)
+
+    if monitor is None:
+        raise HTTPException(404)
+
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=hours)
+
+    statement2 = select(Incident).where(
+        Incident.monitor_id == monitor_id,
+        Incident.started_at < now,
+
+        (
+            Incident.resolved_at.is_(None)
+            | (Incident.resolved_at > cutoff)
+        )
+    )
+
+    result = await session.execute(statement2)
+    incidents = result.scalars().all()
+
+    downtime_seconds = 0
+    longest_incident_seconds = 0
+
+    for incident in incidents:
+        start = max(incident.started_at, cutoff)
+        end = min(incident.resolved_at or now, now)
+
+        duration = (end - start).total_seconds()
+
+        downtime_seconds += duration
+
+        longest_incident_seconds = max(
+            longest_incident_seconds, duration
+        )
+
+    return {
+        "monitor_id": monitor_id,
+        "hours": hours,
+        "incident_count": len(incidents),
+        "downtime_seconds": downtime_seconds,
+        "longest_incident_seconds": longest_incident_seconds
+    }
+
