@@ -98,3 +98,18 @@ def test_patch_idempotency():
     assert response2.status_code == 200
     assert response3.status_code == 200
     assert data["is_active"] == False
+
+def test_put_monitor():
+    response = client.post(f"/monitors", json ={"name": "GitHub", "url": "https://github.com", "interval_seconds": 50})
+    monitor_id = response.json()["id"]
+
+    response2 = client.put(f"monitors/{monitor_id}",json ={"name": "Opal", "url": "https://opal.com", "interval_seconds": 60, "is_active" : True})
+
+    assert response2.status_code == 200
+    response3 = client.get(f"monitors/{monitor_id}")
+    data = response3.json()
+
+    assert data["name"] == "Opal"
+    assert data["url"] == "https://opal.com/"
+    assert data["interval_seconds"] == 60
+    assert data["is_active"] == True

@@ -7,6 +7,8 @@ TRUSTED_URLS = {
     "https://example.com/",
     "https://github.com/",
     "https://www.python.org/",
+    "https://opal.com/"
+
 }
 
 def is_public_ip(value: str) -> bool:

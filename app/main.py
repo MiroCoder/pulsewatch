@@ -30,7 +30,7 @@ class MonitorCreate(BaseModel):
 class MonitorReplace(BaseModel):
     name: str
     url: HttpUrl
-    interval_Seconds: int = Field(gt=0)
+    interval_seconds: int = Field(gt=0)
     is_active : bool
 
 class IncidentRead(BaseModel):
@@ -336,6 +336,7 @@ async def update_full_monitor(monitor_id : int,update : MonitorReplace, session 
     needs_restart = is_active and (
             old_config != new_config or task_missing
     )
+
     if needs_restart:
         await restart_monitor(monitor_id, url, interval_seconds)
     elif is_active == False:
